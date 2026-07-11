@@ -27,19 +27,19 @@ class VideoProcessor:
         self.processor = ImageProcessor()
         self.predictor = DigitPredictor()
         
-        # Performance Tuning for Cloud Containers
+        # Consistent Canvas Size Setup
         self.target_width = 640
         self.target_height = 480
         self.last_processing_time = 0
         
-        # This holds your drawings (White lines on Black background)
+        # Drawing canvas layer (White lines on black background)
         self.internal_canvas = np.zeros((480, 640, 3), dtype=np.uint8)
         
-        # Tracking points to prevent broken lines
+        # Coordinates tracking to prevent broken lines
         self.last_x = None
         self.last_y = None
         
-        # Thread communication states
+        # Thread communication variables
         self.prediction = "-"
         self.confidence = 0.0
         self.current_gesture = "NO HAND"
@@ -47,23 +47,23 @@ class VideoProcessor:
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
         
-        # Downscale to match canvas dimensions
+        # Standardize dimension resolution
         if img.shape[1] != self.target_width or img.shape[0] != self.target_height:
             img = cv2.resize(img, (self.target_width, self.target_height), interpolation=cv2.INTER_AREA)
         img = cv2.flip(img, 1)
 
-        # Drop duplicate processing cycles to optimize frame rates
+        # Optimization: Limit hand-tracking calculations to 25 FPS to maximize cloud performance
         current_time = time.time()
-        if current_time - self.last_processing_time < 0.035:
-            # Show drawings even on skipped frames
+        if current_time - self.last_processing_time < 0.04:
+            # Still display the persistent drawing lines even if we drop tracking on this frame
             gray_canvas = cv2.cvtColor(self.internal_canvas, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(gray_canvas, 10, 255, cv2.THRESH_BINARY)
-            img[mask > 0] = [255, 255, 255] # Draw white trails on camera feed
+            img[mask > 0] = [255, 255, 255]
             return av.VideoFrame.from_ndarray(img, format="bgr24")
         
         self.last_processing_time = current_time
 
-        # Run detection pipeline
+        # Run MediaPipe hand-tracker
         result = self.tracker.detect(img)
         img = self.tracker.draw_landmarks(img, result)
 
@@ -74,12 +74,12 @@ class VideoProcessor:
             self.current_gesture = self.gesture_controller.get_gesture(hand)
             x, y = self.tracker.get_index_finger_tip(hand, img)
 
-            # Draw pointer feedback dot
+            # Draw visual tracking pointer dot
             cv2.circle(img, (x, y), 6, (0, 255, 0), -1)
 
             if self.current_gesture == "DRAW":
                 if self.last_x is not None:
-                    # Draw continuous fluid lines instead of disjointed circles
+                    # Draw solid connected vectors
                     cv2.line(self.internal_canvas, (self.last_x, self.last_y), (x, y), (255, 255, 255), 10)
                 else:
                     cv2.circle(self.internal_canvas, (x, y), 5, (255, 255, 255), -1)
@@ -108,25 +108,25 @@ class VideoProcessor:
             self.last_x = None
             self.last_y = None
 
-        # Overlay drawings from internal_canvas onto your live camera frame feed
+        # Mask operations to render drawings cleanly into live view
         gray_canvas = cv2.cvtColor(self.internal_canvas, cv2.COLOR_BGR2GRAY)
         _, mask = cv2.threshold(gray_canvas, 10, 255, cv2.THRESH_BINARY)
         img[mask > 0] = [255, 255, 255]
 
-        # Draw UI Status text safely on the final array frame image
+        # Draw status text directly onto the video array matrix frame
         cv2.putText(img, f"Gesture: {self.current_gesture}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # -----------------------------
-# Render UI & Stream Control Blocks
+# Render UI Layout Grid
 # -----------------------------
 col1, col2 = st.columns([2, 1])
 
 with col1:
     st.subheader("Live Feed Window")
     ctx = webrtc_streamer(
-        key="air-drawing-v10-final",
+        key="air-drawing-v11-perfect",
         mode=WebRtcMode.SENDRECV,
         video_processor_factory=VideoProcessor,
         media_stream_constraints={
@@ -145,9 +145,24 @@ with col1:
 with col2:
     st.subheader("AI Prediction Analysis")
     
-    metric_slot_1 = st.empty()
-    metric_slot_2 = st.empty()
-    gesture_slot = st.empty()
+    # FIX BLINKING: Isolated component fragment container for text layout rendering
+    @st.fragment(run_every=0.1)
+    def render_metrics_dashboard():
+        pred_val = "-"
+        conf_val = 0.0
+        current_g = "NO HAND"
+        
+        if ctx.video_processor:
+            pred_val = ctx.video_processor.prediction
+            conf_val = ctx.video_processor.confidence
+            current_g = ctx.video_processor.current_gesture
+
+        st.metric(label="Predicted Digit Label", value=pred_val)
+        st.metric(label="Model Confidence Match", value=f"{conf_val:.2f}%")
+        st.info(f"Current Gesture Tracking: **{current_g}**")
+
+    # Initialize layout fragment block
+    render_metrics_dashboard()
     
     st.write("---")
     st.markdown("""
@@ -157,31 +172,12 @@ with col2:
     * ✌️ **PREDICT**: Hold up a gesture to evaluate drawings against the AI model.
     """)
 
-    # Render starting labels
-    metric_slot_1.metric(label="Predicted Digit Label", value="-")
-    metric_slot_2.metric(label="Model Confidence Match", value="0.00%")
-    gesture_slot.info("Current Gesture Tracking: Initializing...")
-
-    st.sidebar.title("Controls & Status")
-    clear_clicked = st.sidebar.button("🧼 Clear Canvas", use_container_width=True, key="canvas_clear_btn_v10")
-
-    # Fast background updater loop for UI metrics
-    while ctx.video_processor:
-        if clear_clicked:
-            ctx.video_processor.internal_canvas.fill(0)
-            ctx.video_processor.prediction = "-"
-            ctx.video_processor.confidence = 0.0
-            ctx.video_processor.last_x = None
-            ctx.video_processor.last_y = None
-            clear_clicked = False 
-
-        pred_val = ctx.video_processor.prediction
-        conf_val = ctx.video_processor.confidence
-        current_g = ctx.video_processor.current_gesture
-        
-        # Inject values directly to bypass layout refresh limits
-        metric_slot_1.metric(label="Predicted Digit Label", value=pred_val)
-        metric_slot_2.metric(label="Model Confidence Match", value=f"{conf_val:.2f}%")
-        gesture_slot.info(f"Current Gesture Tracking: **{current_g}**")
-            
-        time.sleep(0.05)
+# Sidebar manual clear canvas controller button
+st.sidebar.title("Controls & Status")
+if st.sidebar.button("🧼 Clear Canvas", use_container_width=True, key="canvas_clear_btn_v11"):
+    if ctx.video_processor:
+        ctx.video_processor.internal_canvas.fill(0)
+        ctx.video_processor.prediction = "-"
+        ctx.video_processor.confidence = 0.0
+        ctx.video_processor.last_x = None
+        ctx.video_processor.last_y = None
