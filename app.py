@@ -55,7 +55,6 @@ class VideoProcessor:
         # Optimization: Limit hand-tracking calculations to 25 FPS to maximize cloud performance
         current_time = time.time()
         if current_time - self.last_processing_time < 0.04:
-            # Still display the persistent drawing lines even if we drop tracking on this frame
             gray_canvas = cv2.cvtColor(self.internal_canvas, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(gray_canvas, 10, 255, cv2.THRESH_BINARY)
             img[mask > 0] = [255, 255, 255]
@@ -79,7 +78,6 @@ class VideoProcessor:
 
             if self.current_gesture == "DRAW":
                 if self.last_x is not None:
-                    # Draw solid connected vectors
                     cv2.line(self.internal_canvas, (self.last_x, self.last_y), (x, y), (255, 255, 255), 10)
                 else:
                     cv2.circle(self.internal_canvas, (x, y), 5, (255, 255, 255), -1)
@@ -125,8 +123,11 @@ col1, col2 = st.columns([2, 1])
 
 with col1:
     st.subheader("Live Feed Window")
+    
+    # ADDED rtc_configuration: Installs a network pathfinding tunnel 
+    # to open your local camera through secure firewalls up to the cloud app container
     ctx = webrtc_streamer(
-        key="air-drawing-v11-perfect",
+        key="air-drawing-v12-cloud",
         mode=WebRtcMode.SENDRECV,
         video_processor_factory=VideoProcessor,
         media_stream_constraints={
@@ -134,6 +135,9 @@ with col1:
             "audio": False
         },
         async_processing=True,
+        rtc_configuration={
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        },
         video_html_attrs={
             "style": {"width": "100%", "border": "2px solid #333", "border-radius": "8px"},
             "controls": False,
@@ -145,8 +149,7 @@ with col1:
 with col2:
     st.subheader("AI Prediction Analysis")
     
-    # FIX BLINKING: Isolated component fragment container for text layout rendering
-    @st.fragment(run_every=0.1)
+    @st.fragment(run_every=0.2) # Adjusted polling slightly to give network negotiation breathing room
     def render_metrics_dashboard():
         pred_val = "-"
         conf_val = 0.0
@@ -161,7 +164,6 @@ with col2:
         st.metric(label="Model Confidence Match", value=f"{conf_val:.2f}%")
         st.info(f"Current Gesture Tracking: **{current_g}**")
 
-    # Initialize layout fragment block
     render_metrics_dashboard()
     
     st.write("---")
@@ -174,7 +176,7 @@ with col2:
 
 # Sidebar manual clear canvas controller button
 st.sidebar.title("Controls & Status")
-if st.sidebar.button("🧼 Clear Canvas", use_container_width=True, key="canvas_clear_btn_v11"):
+if st.sidebar.button("🧼 Clear Canvas", use_container_width=True, key="canvas_clear_btn_v12"):
     if ctx.video_processor:
         ctx.video_processor.internal_canvas.fill(0)
         ctx.video_processor.prediction = "-"
