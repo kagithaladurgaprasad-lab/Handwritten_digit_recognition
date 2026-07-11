@@ -57,6 +57,10 @@ class VideoProcessor:
             gray_canvas = cv2.cvtColor(self.internal_canvas, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(gray_canvas, 10, 255, cv2.THRESH_BINARY)
             img[mask > 0] = [255, 255, 255]
+            
+            # Draw HUD overlays even on skipped frames to prevent blinking
+            cv2.putText(img, f"GESTURE: {self.current_gesture}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(img, f"PREDICTION: {self.prediction} ({self.confidence:.1f}%)", (20, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             return av.VideoFrame.from_ndarray(img, format="bgr24")
         
         self.last_processing_time = current_time
@@ -110,7 +114,7 @@ class VideoProcessor:
         _, mask = cv2.threshold(gray_canvas, 10, 255, cv2.THRESH_BINARY)
         img[mask > 0] = [255, 255, 255]
 
-        # Draw HUD overlays on frame matrix to eliminate text layout shifts
+        # Draw HUD overlays directly onto the frame matrix to eliminate all layout blinks
         cv2.putText(img, f"GESTURE: {self.current_gesture}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         cv2.putText(img, f"PREDICTION: {self.prediction} ({self.confidence:.1f}%)", (20, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
@@ -119,10 +123,10 @@ class VideoProcessor:
 # -----------------------------
 # Unified Video Stream Component
 # -----------------------------
-st.write("Position your hand inside the frame to draw. The state engine output is burned directly into the monitor video.")
+st.write("Position your hand inside the frame to draw. Tracking states and predictions are burned directly into the video display.")
 
 ctx = webrtc_streamer(
-    key="air-drawing-v13-stable",
+    key="air-drawing-v14-stable",
     mode=WebRtcMode.SENDRECV,
     video_processor_factory=VideoProcessor,
     media_stream_constraints={
