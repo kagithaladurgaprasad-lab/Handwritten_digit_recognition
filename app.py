@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 import av
 import time
+import threading
 
 # Import pipeline modules
 from hand_tracker import HandTracker
@@ -41,8 +42,6 @@ st.markdown(
 st.title("Air Digit Recognition Studio")
 st.caption("Draw a digit in the air with your index finger - no mouse, no touch.")
 
-# Simple, single-codepoint symbols only (no variation-selector emoji, which render as
-# boxes/question marks on some fonts/OS combos). These are safe across Windows/Mac/Linux.
 GESTURE_ICONS = {
     "DRAW": "\u270D",     # writing hand
     "CLEAR": "\u2716",    # heavy X
@@ -59,14 +58,13 @@ with st.sidebar:
     quality_preset = st.select_slider(
         "Performance preset",
         options=["Ultra low power", "Battery saver", "Balanced", "High quality"],
-        value="Battery saver",
-        help="Lower presets trade video sharpness for a smoother, less laggy stream - "
-             "recommended for cloud deployments. Try 'Ultra low power' if things still lag.",
+        value="Balanced",
+        help="Lower presets trade video sharpness for a smoother, less laggy stream.",
     )
     PRESETS = {
-        "Ultra low power": dict(width=320, height=240, fps=10, detect_scale=0.4, process_every=3),
-        "Battery saver":   dict(width=480, height=360, fps=15, detect_scale=0.5, process_every=2),
-        "Balanced":        dict(width=640, height=480, fps=20, detect_scale=0.5, process_every=1),
+        "Ultra low power": dict(width=320, height=240, fps=15, detect_scale=0.4, process_every=3),
+        "Battery saver":   dict(width=480, height=360, fps=20, detect_scale=0.5, process_every=2),
+        "Balanced":        dict(width=640, height=480, fps=25, detect_scale=0.5, process_every=2),
         "High quality":    dict(width=640, height=480, fps=30, detect_scale=0.75, process_every=1),
     }
     cfg = PRESETS[quality_preset]
@@ -74,21 +72,11 @@ with st.sidebar:
     show_skeleton = st.checkbox(
         "Show hand skeleton overlay",
         value=(quality_preset in ("Balanced", "High quality")),
-        help="Drawing the landmark skeleton every frame costs extra time - turn it off "
-             "on slow connections.",
     )
     line_thickness = st.slider("Line thickness", 4, 20, 10)
     use_turn = st.checkbox(
         "Use TURN relay (recommended on cloud)",
         value=True,
-        help="STUN alone frequently fails on Streamlit Community Cloud's network. "
-             "TURN relays the video and fixes most connection-based lag.",
-    )
-    adaptive_skip = st.checkbox(
-        "Adaptive frame skipping (skip only while idle)",
-        value=True,
-        help="Never skips frames while you're actively drawing - only skips when idle "
-             "or no hand is detected, to keep line-drawing responsive.",
     )
 
     st.divider()
@@ -105,9 +93,6 @@ with st.sidebar:
 def get_rtc_configuration(enable_turn: bool):
     ice_servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
     if enable_turn:
-        # Free public TURN relay (Open Relay Project / metered.ca). Fine for demos & light
-        # traffic. For production, swap in your own TURN credentials (Twilio, Cloudflare,
-        # metered.ca paid tier, etc.) - public relays can be rate-limited.
         ice_servers.append(
             {
                 "urls": [
@@ -134,17 +119,14 @@ class VideoProcessor:
 
         self.target_width = cfg["width"]
         self.target_height = cfg["height"]
-        self.detect_scale = cfg["detect_scale"]      # run the hand detector on a smaller frame
-        self.process_every = cfg["process_every"]     # baseline: only run detection every Nth frame
-        self.adaptive_skip = adaptive_skip
+        self.detect_scale = cfg["detect_scale"]
+        self.process_every = cfg["process_every"]
         self.show_skeleton = show_skeleton
         self._frame_count = 0
-        self._proc_time_ema = 1.0 / cfg["fps"]        # running estimate of detection cost (seconds)
 
         self.internal_canvas = np.zeros((self.target_height, self.target_width, 3), dtype=np.uint8)
+        self.lock = threading.Lock()
 
-        # Cached binary mask of the canvas - only rebuilt when the canvas actually changes,
-        # instead of on every single frame.
         self._canvas_dirty = True
         self._cached_mask = None
 
@@ -157,7 +139,6 @@ class VideoProcessor:
         self.fps = 0.0
         self._last_tick = time.time()
 
-    # -- helpers -------------------------------------------------
     def _get_canvas_mask(self):
         if self._canvas_dirty or self._cached_mask is None:
             gray = cv2.cvtColor(self.internal_canvas, cv2.COLOR_BGR2GRAY)
@@ -169,65 +150,40 @@ class VideoProcessor:
     def _draw_hud(self, img):
         cv2.putText(img, f"GESTURE: {self.current_gesture}", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.putText(img, f"PREDICTION: {self.prediction} ({self.confidence:.1f}%)", (20, 450),
+        cv2.putText(img, f"PREDICTION: {self.prediction} ({self.confidence:.1f}%)", (20, self.target_height - 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         return img
 
     def reset_canvas(self):
-        self.internal_canvas.fill(0)
-        self.prediction = "-"
-        self.confidence = 0.0
-        self.last_x = None
-        self.last_y = None
-        self._canvas_dirty = True
+        with self.lock:
+            self.internal_canvas.fill(0)
+            self.prediction = "-"
+            self.confidence = 0.0
+            self.last_x = None
+            self.last_y = None
+            self._canvas_dirty = True
 
-    # -- main callback --------------------------------------------
-    # recv_queued (instead of recv) stops lag from *accumulating*. With a plain recv(), if
-    # the detector takes longer than the frame interval, incoming frames queue up and get
-    # processed one by one - the delay keeps growing and the video falls further and further
-    # behind. recv_queued hands us the whole backlog at once; we keep only the newest frame
-    # and drop the rest, so the stream always reflects "now", not a growing backlog.
     async def recv_queued(self, frames):
-        frame = frames[-1]  # always take the most recent frame, drop any older queued ones
+        # Frame dropping: Always instantly jump to the latest frame to eliminate buffer lag
+        frame = frames[-1] 
         img = frame.to_ndarray(format="bgr24")
 
         if img.shape[1] != self.target_width or img.shape[0] != self.target_height:
-            img = cv2.resize(img, (self.target_width, self.target_height), interpolation=cv2.INTER_AREA)
+            img = cv2.resize(img, (self.target_width, self.target_height), interpolation=cv2.INTER_LINEAR)
         img = cv2.flip(img, 1)
 
         self._frame_count += 1
-
-        # Never skip detection while actively drawing - that's when low latency matters
-        # most. Skipping only helps (and only happens) while idle / no hand present.
-        effective_skip = self.process_every
-        if self.current_gesture == "DRAW":
-            effective_skip = 1
-        elif self.adaptive_skip:
-            frame_budget = 1.0 / max(self.fps, 1.0) if self.fps > 0 else (1.0 / 15)
-            if self._proc_time_ema > frame_budget:
-                effective_skip = max(self.process_every, int(self._proc_time_ema / frame_budget) + 1)
-
-        run_detection = (self._frame_count % effective_skip == 0)
-
-        if run_detection:
-            t0 = time.time()
-            # Detect on a downscaled copy for speed. HandTracker/get_index_finger_tip are
-            # expected to return normalized (0-1) landmark coordinates, so we still draw and
-            # read positions using the full-resolution `img` - only the (expensive) detector
-            # call itself runs on the smaller frame.
+        
+        # Only run heavy AI tracking every Nth frame to preserve CPU capacity
+        if self._frame_count % self.process_every == 0:
             if self.detect_scale < 1.0:
-                small = cv2.resize(img, None, fx=self.detect_scale, fy=self.detect_scale,
-                                    interpolation=cv2.INTER_LINEAR)
+                small = cv2.resize(img, None, fx=self.detect_scale, fy=self.detect_scale, interpolation=cv2.INTER_LINEAR)
                 result = self.tracker.detect(small)
             else:
                 result = self.tracker.detect(img)
 
             if self.show_skeleton:
                 img = self.tracker.draw_landmarks(img, result)
-
-            # track how expensive detection actually was, to drive adaptive skipping
-            proc_dt = time.time() - t0
-            self._proc_time_ema = 0.8 * self._proc_time_ema + 0.2 * proc_dt
 
             self.current_gesture = "NO HAND"
 
@@ -238,17 +194,17 @@ class VideoProcessor:
                 cv2.circle(img, (x, y), 6, (0, 255, 0), -1)
 
                 if self.current_gesture == "DRAW":
-                    if self.last_x is not None:
-                        cv2.line(self.internal_canvas, (self.last_x, self.last_y), (x, y),
-                                  (255, 255, 255), line_thickness)
-                    else:
-                        cv2.circle(self.internal_canvas, (x, y), line_thickness // 2, (255, 255, 255), -1)
-                    self.last_x, self.last_y = x, y
-                    self._canvas_dirty = True
+                    with self.lock:
+                        if self.last_x is not None:
+                            cv2.line(self.internal_canvas, (self.last_x, self.last_y), (x, y),
+                                     (255, 255, 255), line_thickness)
+                        else:
+                            cv2.circle(self.internal_canvas, (x, y), line_thickness // 2, (255, 255, 255), -1)
+                        self.last_x, self.last_y = x, y
+                        self._canvas_dirty = True
 
                 elif self.current_gesture == "PREDICT":
-                    self.last_x = None
-                    self.last_y = None
+                    self.last_x, self.last_y = None, None
                     processed_img = self.processor.preprocess(self.internal_canvas)
                     if processed_img is not None:
                         pred, conf = self.predictor.predict(processed_img)
@@ -258,18 +214,15 @@ class VideoProcessor:
                 elif self.current_gesture == "CLEAR":
                     self.reset_canvas()
                 else:
-                    self.last_x = None
-                    self.last_y = None
+                    self.last_x, self.last_y = None, None
             else:
-                self.last_x = None
-                self.last_y = None
+                self.last_x, self.last_y = None, None
 
-        # Composite the (cached) canvas mask onto the live frame every frame, cheaply.
+        # Composite drawn elements overlay instantly onto the live frame
         mask = self._get_canvas_mask()
         img[mask] = [255, 255, 255]
         img = self._draw_hud(img)
 
-        # rough FPS tracking for the status panel
         now = time.time()
         dt = now - self._last_tick
         if dt > 0:
@@ -324,20 +277,10 @@ with info_col:
 """,
         unsafe_allow_html=True,
     )
-    st.info(
-        "If video still feels slow after 'Ultra low power' + TURN relay, the bottleneck is "
-        "likely CPU on the shared cloud instance rather than the network. For near-zero "
-        "drawing latency, the line needs to be drawn client-side in the browser instead of "
-        "round-tripping through the server - ask if you want that version built."
-    )
 
-# Handle sidebar reset
 if reset_clicked and ctx.video_processor:
     ctx.video_processor.reset_canvas()
 
-# =========================================================
-# Live status panel (polls the processor thread while streaming)
-# =========================================================
 if ctx.state.playing:
     while ctx.state.playing:
         vp = ctx.video_processor
