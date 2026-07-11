@@ -46,36 +46,24 @@ with st.sidebar:
 
     quality_preset = st.select_slider(
         "Performance preset",
-        options=["Ultra low power", "Battery saver", "Balanced", "High quality"],
-        value="Battery saver",
+        options=["Battery saver", "Balanced", "High quality"],
+        value="Balanced",
         help="Lower presets trade video sharpness for a smoother, less laggy stream — "
-             "recommended for cloud deployments. Start with 'Ultra low power' if things "
-             "are still laggy.",
+             "recommended for cloud deployments.",
     )
     PRESETS = {
-        "Ultra low power": dict(width=320, height=240, fps=10, detect_scale=0.4, process_every=3),
-        "Battery saver":   dict(width=480, height=360, fps=15, detect_scale=0.5, process_every=2),
-        "Balanced":        dict(width=640, height=480, fps=20, detect_scale=0.5, process_every=1),
-        "High quality":    dict(width=640, height=480, fps=30, detect_scale=0.75, process_every=1),
+        "Battery saver": dict(width=480, height=360, fps=15, detect_scale=0.5, process_every=2),
+        "Balanced":      dict(width=640, height=480, fps=20, detect_scale=0.5, process_every=1),
+        "High quality":  dict(width=640, height=480, fps=30, detect_scale=0.75, process_every=1),
     }
     cfg = PRESETS[quality_preset]
 
-    show_skeleton = st.checkbox(
-        "Show hand skeleton overlay", value=(quality_preset in ("Balanced", "High quality")),
-        help="Drawing the landmark skeleton every frame costs extra time — turning it off "
-             "helps on slow connections.",
-    )
     line_thickness = st.slider("Line thickness", 4, 20, 10)
     use_turn = st.checkbox(
         "Use TURN relay (recommended on cloud)",
         value=True,
         help="STUN alone frequently fails on Streamlit Community Cloud's network, causing "
              "the exact lag/freeze you're seeing. TURN relays the video and fixes it.",
-    )
-    adaptive_skip = st.checkbox(
-        "Adaptive frame skipping", value=True,
-        help="Automatically skips more frames if the server is running behind, so the "
-             "video doesn't build up a growing backlog of stale frames.",
     )
 
     st.divider()
@@ -122,11 +110,8 @@ class VideoProcessor:
         self.target_width = cfg["width"]
         self.target_height = cfg["height"]
         self.detect_scale = cfg["detect_scale"]      # run the hand detector on a smaller frame
-        self.process_every = cfg["process_every"]     # baseline: only run detection every Nth frame
-        self.adaptive_skip = adaptive_skip
-        self.show_skeleton = show_skeleton
+        self.process_every = cfg["process_every"]     # only run detection every Nth frame
         self._frame_count = 0
-        self._proc_time_ema = 1.0 / cfg["fps"]        # running estimate of detection cost (seconds)
 
         self.internal_canvas = np.zeros((self.target_height, self.target_width, 3), dtype=np.uint8)
 
@@ -169,14 +154,7 @@ class VideoProcessor:
         self._canvas_dirty = True
 
     # -- main callback --------------------------------------------
-    # NOTE: recv_queued (instead of recv) is what stops lag from *accumulating*. With a plain
-    # recv(), if the detector takes longer than the frame interval, streamlit-webrtc queues
-    # incoming frames and processes them one by one — the delay keeps growing and the video
-    # falls further and further behind. recv_queued gives us the whole backlog at once; we
-    # process only the newest frame and drop the rest, so the stream always shows "now",
-    # never a growing backlog of "a few seconds ago".
-    async def recv_queued(self, frames):
-        frame = frames[-1]  # always take the most recent frame, drop any older queued ones
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
 
         if img.shape[1] != self.target_width or img.shape[0] != self.target_height:
@@ -184,19 +162,9 @@ class VideoProcessor:
         img = cv2.flip(img, 1)
 
         self._frame_count += 1
-
-        # Adaptive skip: if detection has been taking longer than the frame budget, skip
-        # detection on proportionally more frames instead of falling behind.
-        effective_skip = self.process_every
-        if self.adaptive_skip:
-            frame_budget = 1.0 / max(self.fps, 1.0) if self.fps > 0 else (1.0 / 15)
-            if self._proc_time_ema > frame_budget:
-                effective_skip = max(self.process_every, int(self._proc_time_ema / frame_budget) + 1)
-
-        run_detection = (self._frame_count % effective_skip == 0)
+        run_detection = (self._frame_count % self.process_every == 0)
 
         if run_detection:
-            t0 = time.time()
             # Detect on a downscaled copy for speed. HandTracker/get_index_finger_tip are
             # expected to return normalized (0-1) landmark coordinates, so we still draw and
             # read positions using the full-resolution `img` — only the (expensive) detector
@@ -208,13 +176,7 @@ class VideoProcessor:
             else:
                 result = self.tracker.detect(img)
 
-            if self.show_skeleton:
-                img = self.tracker.draw_landmarks(img, result)
-
-            # track how expensive detection actually was, to drive adaptive skipping
-            proc_dt = time.time() - t0
-            self._proc_time_ema = 0.8 * self._proc_time_ema + 0.2 * proc_dt
-
+            img = self.tracker.draw_landmarks(img, result)
             self.current_gesture = "NO HAND"
 
             if result.hand_landmarks:
@@ -262,7 +224,7 @@ class VideoProcessor:
             self.fps = 0.9 * self.fps + 0.1 * (1.0 / dt)
         self._last_tick = now
 
-        return [av.VideoFrame.from_ndarray(img, format="bgr24")]
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
 # =========================================================
