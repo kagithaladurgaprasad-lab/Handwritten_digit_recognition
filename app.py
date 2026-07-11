@@ -187,8 +187,12 @@ class VideoProcessor:
 
         # Adaptive skip: if detection has been taking longer than the frame budget, skip
         # detection on proportionally more frames instead of falling behind.
+        # BUT: never skip while the user is actively drawing — that's exactly when low
+        # latency matters most. Skipping is only useful while idle / no hand present.
         effective_skip = self.process_every
-        if self.adaptive_skip:
+        if self.current_gesture == "DRAW":
+            effective_skip = 1
+        elif self.adaptive_skip:
             frame_budget = 1.0 / max(self.fps, 1.0) if self.fps > 0 else (1.0 / 15)
             if self._proc_time_ema > frame_budget:
                 effective_skip = max(self.process_every, int(self._proc_time_ema / frame_budget) + 1)
