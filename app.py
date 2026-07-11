@@ -23,36 +23,44 @@ st.title("🖐️ Air Digit Recognition Studio")
 # -----------------------------
 class VideoProcessor:
     def __init__(self):
-        # Instantiate objects safely INSIDE the worker thread to prevent thread crashes
         self.tracker = HandTracker()
         self.gesture_controller = GestureController()
         self.canvas = VirtualCanvas()
         self.processor = ImageProcessor()
         self.predictor = DigitPredictor()
         
+        # Performance Tuning: Lower resolution logic to reduce internet/cloud lag
+        self.target_width = 640
+        self.target_height = 480
+        
         # State trackers
         self.last_x = None
         self.last_y = None
-        self.max_jump = 65  
+        self.max_jump = 50  
         self.last_processing_time = 0
         
-        # Smooth line retention: counter to ignore transient single-frame tracking drops
+        # Smooth line retention frame buffers
         self.frames_since_last_hand = 0
-        self.max_missing_frames_buffer = 5 
+        self.max_missing_frames_buffer = 4 
         
         # Thread communication commands
         self.force_clear_canvas = False
         
-        # Output strings that the main thread can read safely
+        # Thread metrics tracking
         self.prediction = "-"
         self.confidence = 0.0
         self.current_gesture = "NO HAND"
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
+        
+        # Optimization 1: Downscale incoming video to 640x480 instantly to save cloud CPU bandwidth
+        if img.shape[1] > self.target_width or img.shape[0] > self.target_height:
+            img = cv2.resize(img, (self.target_width, self.target_height), interpolation=cv2.INTER_AREA)
+            
         img = cv2.flip(img, 1)
 
-        # Check if UI thread issued a mandatory canvas clear command
+        # Process forced clear requests immediately
         if self.force_clear_canvas:
             self.canvas.clear()
             self.prediction = "-"
@@ -61,15 +69,16 @@ class VideoProcessor:
             self.last_y = None
             self.force_clear_canvas = False 
 
-        # Drop frames if CPU is lagging behind to maintain a high browser refresh rate
+        # Optimization 2: Intelligent Frame Dropping 
+        # Limits processing strictly to ~22 FPS to prevent remote background container thread locking
         current_time = time.time()
-        if current_time - self.last_processing_time < 0.03:
+        if current_time - self.last_processing_time < 0.045:
             output_frame = self.canvas.overlay(img)
             return av.VideoFrame.from_ndarray(output_frame, format="bgr24")
         
         self.last_processing_time = current_time
 
-        # Execute processing pipeline modules natively
+        # Execute tracking pipeline modules
         result = self.tracker.detect(img)
         img = self.tracker.draw_landmarks(img, result)
 
@@ -79,7 +88,7 @@ class VideoProcessor:
             self.current_gesture = self.gesture_controller.get_gesture(hand)
             x, y = self.tracker.get_index_finger_tip(hand, img)
 
-            cv2.circle(img, (x, y), 8, (0, 255, 0), -1)
+            cv2.circle(img, (x, y), 6, (0, 255, 0), -1)
 
             if self.current_gesture == "DRAW":
                 if self.last_x is not None:
@@ -105,7 +114,6 @@ class VideoProcessor:
                 self.last_x = None
                 self.last_y = None
 
-            # --- DETECT GESTURE CLEAR STATE ---
             elif self.current_gesture == "CLEAR":
                 self.canvas.clear()
                 self.prediction = "-"
@@ -127,7 +135,7 @@ class VideoProcessor:
                 self.last_x = None
                 self.last_y = None
 
-        # Build composite video frame
+        # Build composite final output video frame
         output_frame = self.canvas.overlay(img)
         cv2.putText(output_frame, f"Gesture: {self.current_gesture}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         
@@ -140,18 +148,26 @@ col1, col2 = st.columns([2, 1])
 
 with col1:
     st.subheader("Live Feed Window")
+    
+    # Optimization 3: Constraint passing to tell your browser to output lower byte streams directly
     ctx = webrtc_streamer(
-        key="air-drawing-v7",
+        key="air-drawing-v8-cloud",
         mode=WebRtcMode.SENDRECV,
         video_processor_factory=VideoProcessor,
-        media_stream_constraints={"video": True, "audio": False},
+        media_stream_constraints={
+            "video": {
+                "width": {"ideal": 640},
+                "height": {"ideal": 480},
+                "frameRate": {"ideal": 24}
+            },
+            "audio": False
+        },
         async_processing=True,
     )
 
 with col2:
     st.subheader("AI Prediction Analysis")
     
-    # Create empty structural slots that we can inject text into directly
     metric_slot_1 = st.empty()
     metric_slot_2 = st.empty()
     
@@ -164,26 +180,22 @@ with col2:
     4. Transition into **PREDICT** parameters to run classification matrices.
     """)
 
-    # Render static initial states
     metric_slot_1.metric(label="Predicted Digit Label", value="-")
     metric_slot_2.metric(label="Model Confidence Match", value="0.00%")
 
-    # --- SIDEBAR CONTROL RENDERING ---
     st.sidebar.title("Controls & Status")
-    clear_clicked = st.sidebar.button("🧼 Clear Canvas", use_container_width=True, key="canvas_clear_btn_v7")
+    clear_clicked = st.sidebar.button("🧼 Clear Canvas", use_container_width=True, key="canvas_clear_btn_v8")
 
-    # --- ULTRA-FAST LIGHTWEIGHT UPDATE LOOP ---
+    # Lightweight metric refresh loop
     while ctx.video_processor:
         if clear_clicked:
             ctx.video_processor.force_clear_canvas = True
             clear_clicked = False 
 
-        # Safely extract metrics values from the background thread running the camera pipeline
         pred_val = ctx.video_processor.prediction
         conf_val = ctx.video_processor.confidence
         
-        # Inject directly into placeholder frames without page reruns
         metric_slot_1.metric(label="Predicted Digit Label", value=pred_val)
         metric_slot_2.metric(label="Model Confidence Match", value=f"{conf_val:.2f}%")
             
-        time.sleep(0.05)
+        time.sleep(0.08)  # Optimization 4: Polling dropped to 12Hz to prevent main thread blocking
