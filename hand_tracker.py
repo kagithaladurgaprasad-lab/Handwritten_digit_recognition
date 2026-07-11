@@ -1,29 +1,31 @@
 import cv2
 import mediapipe as mp
+import time
 
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+from mediapipe.tasks.python.vision import RunningMode
 
 
 class HandTracker:
 
     def __init__(self):
-
-        # Load MediaPipe Hand Landmarker Model
+        # Load MediaPipe Hand Landmarker Model Optimized for Video Tracking Streams
         base_options = python.BaseOptions(
             model_asset_path="hand_landmarker.task"
         )
 
         options = vision.HandLandmarkerOptions(
             base_options=base_options,
-            num_hands=1,
-            min_hand_detection_confidence=0.5,
+            running_mode=RunningMode.VIDEO,  # CRITICAL: Enables rapid temporal cross-frame tracking
+            num_hands=1,                     # Locks calculation resources to a single target
+            min_hand_detection_confidence=0.4, # Dropped slightly for much faster initial detection handshakes
             min_tracking_confidence=0.5
         )
 
         self.detector = vision.HandLandmarker.create_from_options(options)
 
-        # Hand Connections
+        # Hand Connections (Static Definition)
         self.connections = [
             (0,1),(1,2),(2,3),(3,4),
             (0,5),(5,6),(6,7),(7,8),
@@ -34,10 +36,9 @@ class HandTracker:
         ]
 
     # -------------------------
-    # Detect Hand
+    # Detect Hand (Optimized for Video Frames)
     # -------------------------
     def detect(self, frame):
-
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         mp_image = mp.Image(
@@ -45,51 +46,43 @@ class HandTracker:
             data=rgb
         )
 
-        result = self.detector.detect(mp_image)
+        # Generate a unique timestamp in milliseconds for running video mode tracking
+        timestamp_ms = int(time.time() * 1000)
+        result = self.detector.detect_for_video(mp_image, timestamp_ms)
 
         return result
 
     # -------------------------
-    # Draw Hand Landmarks
+    # Draw Hand Landmarks (Optimized: No Redundant Math)
     # -------------------------
     def draw_landmarks(self, frame, result):
-
         if not result.hand_landmarks:
             return frame
 
         h, w, _ = frame.shape
 
         for hand in result.hand_landmarks:
+            # Step 1: Pre-compute pixels ONCE instead of recalculating for dots and lines
+            coords = [(int(lm.x * w), int(lm.y * h)) for lm in hand]
 
-            # Draw Landmark Points
-            for landmark in hand:
-
-                x = int(landmark.x * w)
-                y = int(landmark.y * h)
-
-                cv2.circle(
-                    frame,
-                    (x, y),
-                    5,
-                    (0, 255, 0),
-                    -1
-                )
-
-            # Draw Skeleton
+            # Step 2: Draw Skeleton Connections fast using pre-computed index mapping
             for start, end in self.connections:
-
-                x1 = int(hand[start].x * w)
-                y1 = int(hand[start].y * h)
-
-                x2 = int(hand[end].x * w)
-                y2 = int(hand[end].y * h)
-
                 cv2.line(
                     frame,
-                    (x1, y1),
-                    (x2, y2),
+                    coords[start],
+                    coords[end],
                     (255, 0, 0),
                     2
+                )
+
+            # Step 3: Draw Landmark Points
+            for pt in coords:
+                cv2.circle(
+                    frame,
+                    pt,
+                    4,
+                    (0, 255, 0),
+                    -1
                 )
 
         return frame
@@ -98,30 +91,13 @@ class HandTracker:
     # Get Index Finger Tip
     # -------------------------
     def get_index_finger_tip(self, hand, frame):
-
         h, w, _ = frame.shape
-
         tip = hand[8]
-
-        x = int(tip.x * w)
-        y = int(tip.y * h)
-
-        return x, y
+        return int(tip.x * w), int(tip.y * h)
 
     # -------------------------
     # Get All Landmark Coordinates
     # -------------------------
     def get_landmark_coordinates(self, hand, frame):
-
         h, w, _ = frame.shape
-
-        landmarks = []
-
-        for landmark in hand:
-
-            x = int(landmark.x * w)
-            y = int(landmark.y * h)
-
-            landmarks.append((x, y))
-
-        return landmarks
+        return [(int(lm.x * w), int(lm.y * h)) for lm in hand]
