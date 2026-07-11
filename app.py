@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, WebRtcMode
 import cv2
@@ -14,7 +15,7 @@ from digit_predictor import DigitPredictor
 # =========================================================
 # Page config + light theming
 # =========================================================
-st.set_page_config(page_title="Air Digit Recognition", page_icon="🖐️", layout="wide")
+st.set_page_config(page_title="Air Digit Recognition", page_icon=":hand:", layout="wide")
 
 st.markdown(
     """
@@ -30,27 +31,37 @@ st.markdown(
     }
     .status-label {font-size: 0.8rem; opacity: 0.7; letter-spacing: 0.05em; text-transform: uppercase;}
     .status-value {font-size: 1.6rem; font-weight: 700; margin-top: 0.15rem;}
+    .gesture-row {display: flex; align-items: center; gap: 0.6rem; padding: 0.4rem 0;}
+    .gesture-icon {font-size: 1.3rem; width: 1.6rem; text-align: center;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("🖐️ Air Digit Recognition Studio")
-st.caption("Draw a digit in the air with your index finger — no mouse, no touch.")
+st.title("Air Digit Recognition Studio")
+st.caption("Draw a digit in the air with your index finger - no mouse, no touch.")
+
+# Simple, single-codepoint symbols only (no variation-selector emoji, which render as
+# boxes/question marks on some fonts/OS combos). These are safe across Windows/Mac/Linux.
+GESTURE_ICONS = {
+    "DRAW": "\u270D",     # writing hand
+    "CLEAR": "\u2716",    # heavy X
+    "PREDICT": "\u2713",  # check mark
+    "NO HAND": "\u2014",  # em dash
+}
 
 # =========================================================
 # Sidebar controls
 # =========================================================
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("Settings")
 
     quality_preset = st.select_slider(
         "Performance preset",
         options=["Ultra low power", "Battery saver", "Balanced", "High quality"],
         value="Battery saver",
-        help="Lower presets trade video sharpness for a smoother, less laggy stream — "
-             "recommended for cloud deployments. Start with 'Ultra low power' if things "
-             "are still laggy.",
+        help="Lower presets trade video sharpness for a smoother, less laggy stream - "
+             "recommended for cloud deployments. Try 'Ultra low power' if things still lag.",
     )
     PRESETS = {
         "Ultra low power": dict(width=320, height=240, fps=10, detect_scale=0.4, process_every=3),
@@ -61,21 +72,23 @@ with st.sidebar:
     cfg = PRESETS[quality_preset]
 
     show_skeleton = st.checkbox(
-        "Show hand skeleton overlay", value=(quality_preset in ("Balanced", "High quality")),
-        help="Drawing the landmark skeleton every frame costs extra time — turning it off "
-             "helps on slow connections.",
+        "Show hand skeleton overlay",
+        value=(quality_preset in ("Balanced", "High quality")),
+        help="Drawing the landmark skeleton every frame costs extra time - turn it off "
+             "on slow connections.",
     )
     line_thickness = st.slider("Line thickness", 4, 20, 10)
     use_turn = st.checkbox(
         "Use TURN relay (recommended on cloud)",
         value=True,
-        help="STUN alone frequently fails on Streamlit Community Cloud's network, causing "
-             "the exact lag/freeze you're seeing. TURN relays the video and fixes it.",
+        help="STUN alone frequently fails on Streamlit Community Cloud's network. "
+             "TURN relays the video and fixes most connection-based lag.",
     )
     adaptive_skip = st.checkbox(
-        "Adaptive frame skipping", value=True,
-        help="Automatically skips more frames if the server is running behind, so the "
-             "video doesn't build up a growing backlog of stale frames.",
+        "Adaptive frame skipping (skip only while idle)",
+        value=True,
+        help="Never skips frames while you're actively drawing - only skips when idle "
+             "or no hand is detected, to keep line-drawing responsive.",
     )
 
     st.divider()
@@ -83,7 +96,7 @@ with st.sidebar:
     status_placeholder = st.empty()
 
     st.divider()
-    reset_clicked = st.button("🧼 Emergency Reset Canvas", use_container_width=True)
+    reset_clicked = st.button("Emergency Reset Canvas", use_container_width=True)
 
 
 # =========================================================
@@ -94,7 +107,7 @@ def get_rtc_configuration(enable_turn: bool):
     if enable_turn:
         # Free public TURN relay (Open Relay Project / metered.ca). Fine for demos & light
         # traffic. For production, swap in your own TURN credentials (Twilio, Cloudflare,
-        # metered.ca paid tier, etc.) — public relays can be rate-limited.
+        # metered.ca paid tier, etc.) - public relays can be rate-limited.
         ice_servers.append(
             {
                 "urls": [
@@ -130,7 +143,7 @@ class VideoProcessor:
 
         self.internal_canvas = np.zeros((self.target_height, self.target_width, 3), dtype=np.uint8)
 
-        # Cached binary mask of the canvas — only rebuilt when the canvas actually changes,
+        # Cached binary mask of the canvas - only rebuilt when the canvas actually changes,
         # instead of on every single frame.
         self._canvas_dirty = True
         self._cached_mask = None
@@ -169,12 +182,11 @@ class VideoProcessor:
         self._canvas_dirty = True
 
     # -- main callback --------------------------------------------
-    # NOTE: recv_queued (instead of recv) is what stops lag from *accumulating*. With a plain
-    # recv(), if the detector takes longer than the frame interval, streamlit-webrtc queues
-    # incoming frames and processes them one by one — the delay keeps growing and the video
-    # falls further and further behind. recv_queued gives us the whole backlog at once; we
-    # process only the newest frame and drop the rest, so the stream always shows "now",
-    # never a growing backlog of "a few seconds ago".
+    # recv_queued (instead of recv) stops lag from *accumulating*. With a plain recv(), if
+    # the detector takes longer than the frame interval, incoming frames queue up and get
+    # processed one by one - the delay keeps growing and the video falls further and further
+    # behind. recv_queued hands us the whole backlog at once; we keep only the newest frame
+    # and drop the rest, so the stream always reflects "now", not a growing backlog.
     async def recv_queued(self, frames):
         frame = frames[-1]  # always take the most recent frame, drop any older queued ones
         img = frame.to_ndarray(format="bgr24")
@@ -185,10 +197,8 @@ class VideoProcessor:
 
         self._frame_count += 1
 
-        # Adaptive skip: if detection has been taking longer than the frame budget, skip
-        # detection on proportionally more frames instead of falling behind.
-        # BUT: never skip while the user is actively drawing — that's exactly when low
-        # latency matters most. Skipping is only useful while idle / no hand present.
+        # Never skip detection while actively drawing - that's when low latency matters
+        # most. Skipping only helps (and only happens) while idle / no hand present.
         effective_skip = self.process_every
         if self.current_gesture == "DRAW":
             effective_skip = 1
@@ -203,7 +213,7 @@ class VideoProcessor:
             t0 = time.time()
             # Detect on a downscaled copy for speed. HandTracker/get_index_finger_tip are
             # expected to return normalized (0-1) landmark coordinates, so we still draw and
-            # read positions using the full-resolution `img` — only the (expensive) detector
+            # read positions using the full-resolution `img` - only the (expensive) detector
             # call itself runs on the smaller frame.
             if self.detect_scale < 1.0:
                 small = cv2.resize(img, None, fx=self.detect_scale, fy=self.detect_scale,
@@ -276,7 +286,7 @@ video_col, info_col = st.columns([2, 1])
 
 with video_col:
     ctx = webrtc_streamer(
-        key="air-drawing-v15-optimized",
+        key="air-drawing-v16",
         mode=WebRtcMode.SENDRECV,
         video_processor_factory=VideoProcessor,
         media_stream_constraints={
@@ -307,16 +317,18 @@ with video_col:
 with info_col:
     st.subheader("System Gestures")
     st.markdown(
-        """
-- 🖐️ **DRAW** — move index finger to paint
-- ✊ **CLEAR** — closed fist wipes the canvas
-- ✌️ **PREDICT** — hold gesture to run the model
-"""
+        f"""
+<div class="gesture-row"><span class="gesture-icon">{GESTURE_ICONS['DRAW']}</span> <b>DRAW</b> &mdash; move index finger to paint</div>
+<div class="gesture-row"><span class="gesture-icon">{GESTURE_ICONS['CLEAR']}</span> <b>CLEAR</b> &mdash; closed fist wipes the canvas</div>
+<div class="gesture-row"><span class="gesture-icon">{GESTURE_ICONS['PREDICT']}</span> <b>PREDICT</b> &mdash; hold gesture to run the model</div>
+""",
+        unsafe_allow_html=True,
     )
     st.info(
-        "If the video still feels slow after switching to **Battery saver** + **TURN relay**, "
-        "the bottleneck is likely CPU on Streamlit Cloud's shared instance rather than the network — "
-        "consider a smaller/quantized model in `digit_predictor.py`."
+        "If video still feels slow after 'Ultra low power' + TURN relay, the bottleneck is "
+        "likely CPU on the shared cloud instance rather than the network. For near-zero "
+        "drawing latency, the line needs to be drawn client-side in the browser instead of "
+        "round-tripping through the server - ask if you want that version built."
     )
 
 # Handle sidebar reset
@@ -330,11 +342,12 @@ if ctx.state.playing:
     while ctx.state.playing:
         vp = ctx.video_processor
         if vp is not None:
+            icon = GESTURE_ICONS.get(vp.current_gesture, "\u2014")
             status_placeholder.markdown(
                 f"""
 <div class="status-card">
   <div class="status-label">Gesture</div>
-  <div class="status-value">{vp.current_gesture}</div>
+  <div class="status-value">{icon} {vp.current_gesture}</div>
 </div>
 <div class="status-card">
   <div class="status-label">Prediction</div>
